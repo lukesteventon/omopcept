@@ -1,0 +1,611 @@
+```{r setup, include=FALSE}
+setwd("A:\\Innovate Project (September 2023)")
+#install.packages("tidyverse")
+#install.packages("remotes")
+#install.packages("remotes")
+#install.packages("usethis")
+#install.packages("fuzzyjoin")
+#remotes::install_github("andysouth/omopcept")
+library(tidyverse)
+library(lubridate)
+library(omopr)
+library(remotes)
+#options(download.file.method = "wininet")
+library("devtools")
+library(usethis)
+#usethis::edit_r_environ()
+library(omopcept)
+```
+
+Read in the OMOPS data: this loads a list of dataframes that can be used. 
+```{r}
+#Extraction of drug, person and measurement dataframes:
+breast_omop <-readRDS("omop_cancer_breast2023-09-21.rds")
+breast_measurement <- breast_omop$measurement
+breast_person <- breast_omop$person
+breast_drug <- breast_omop$drug_exposure
+breast_observation <- breast_omop$observation
+breast_condition <- breast_omop$condition_occurrence%>% omop_join_name_all()
+
+
+#This extraction from Clarity (another Epic data warehouse) should contain treatment plans for all cancer patients.
+cancertreatmentplans<-
+readRDS("cancer_treatment_clarity_2023_09_21.rds")
+
+breast_measurement %>% 
+ omop_join_name_all() %>% count(measurement_concept_name)
+```
+```{r}
+#Link the person and drug exposure tables by person_id. Select only columns needed as the dataset is large.
+breast_person_drug<-breast_person %>% 
+  merge(breast_drug, by="person_id") %>% 
+  distinct(person_id, drug_concept_id,drug_exposure_start_datetime,.keep_all=T) %>% 
+  omop_join_name_all() %>% 
+  select(person_id, gender_source_value, year_of_birth, month_of_birth,person_source_value, race_concept_name, drug_concept_name,drug_exposure_start_date, drug_source_concept_name)
+
+breast_person_drug %>% count(drug_source_concept_name)
+```
+
+Create problem list for each patient:
+```{r}
+breast_condition2<-breast_condition %>% 
+  group_by(person_id) %>% 
+  mutate(Diabetes=ifelse(str_detect(condition_concept_name, "Diabetes|diabetes"),1,0)) %>% 
+  mutate(Cardiovascular=ifelse(str_detect(condition_concept_name, "Cardiovascular|cardiovascular|CVD|Angina|angina|hypertension|Hypertension|Myocardial in|myocardial inf"),1,0)) %>% 
+  mutate(Arthritis=ifelse(str_detect(condition_concept_name, "Arthritis|arthritis"),1,0)) %>% 
+  mutate(Hepatitis=ifelse(str_detect(condition_concept_name, "Hepatitis|hepatitis|Hepatitis"),1,0)) %>% 
+  mutate(Epilepsy=ifelse(str_detect(condition_concept_name, "epilepsy|Epilepsy"),1,0)) %>% 
+  mutate(Thyroid=ifelse(str_detect(condition_concept_name, "Thyroid|thyroid"),1,0)) %>% 
+  mutate(Resp=ifelse(str_detect(condition_concept_name, "Respiratory|respiratory|Pulmonary|pulmonary"),1,0)) %>% 
+  mutate("Chronic UC"=ifelse(str_detect(condition_concept_name, " Ulcerative colitis|ulcerative colitis"),1,0)) %>% 
+  mutate("Autoimmune UC"=ifelse(str_detect(condition_concept_name, " Autoimmune|autoimmune"),1,0)) %>% 
+   mutate(MH=ifelse(str_detect(condition_concept_name, "Depression|depression|anxiety|Anxiety|bipolar|Bipolar|suicid|Suici|paranoi|Paranoid|schizo|Schizo|mood disorder|Mood disorder|post traumatic|Post traumatic|Post-traumatic|post-traumatic|PTSD|Obsessive compusive|obsessive compulsive"),1,0)) %>% 
+  arrange(person_id) %>% 
+  distinct(person_id,.keep_all=T)
+```
+
+```{r}
+#Treatment plan table contains MRNs. Use this to link to person_source_value
+#breast_treatment_plan<-breast_treatment_plan %>% 
+#  rename(person_MRN=PAT_MRN_ID) 
+
+breast_treatment_plan<-cancertreatmentplans
+
+
+breast_person_drug<-breast_person_drug %>% #This identifier will have to change 
+  rename(PAT_MRN_ID=person_source_value)
+```
+
+Pivot wide for treatment plans for patients who have multiple
+```{r}
+breast_treatment_plan<-breast_treatment_plan %>% 
+  distinct(PAT_MRN_ID, TREATMENT_PLAN_NAME) %>% 
+  arrange(PAT_MRN_ID) %>% 
+  group_by(PAT_MRN_ID) %>%
+  mutate(row_number()) %>% 
+  pivot_wider(values_from="TREATMENT_PLAN_NAME", names_from = "row_number()",names_prefix="regimen")
+
+breast_person_drug %>% 
+  count(drug_concept_name)
+```
+
+Merging duplicates rows for each regimen that the patient received. Need to figure out how to maintain drugs and dates:
+```{r}
+#This row selects chemo dates:
+breast_person_drug<- breast_person_drug %>% 
+  arrange(PAT_MRN_ID, drug_exposure_start_date) %>% 
+  filter(str_detect(drug_source_concept_name,"atezo|Atezo|ATEZO|fluoro|Fluoro|FLUORO|Gemcitabine|gemcitabine|GEMCITABINE|NIVOLUMAB|Nivolumab|nivolumab|oxaliplatin|Oxaliplatin|OXALIPLATIN|CYCLOPH|Cyclophos|cylopho|topotecan|TOPOTECAN|Topotecan|Docetaxel|docetaxel|DOCETAXEL|paclitaxel|PACLITAXEL|Paclitaxel|Carboplatin|carboplatin|CARBOPLATIN|DPYD|dihydropyrimidine|Dihydropyrmidi|Omeprazole|omeprazole|OMEPRAZOLE|gcsf|GCSF|Gcsf|filgrastim|FILGRASTIM|Filgras|Granulocyte|granulocyte|GRANULOCYTE|Durvalum|durvalu|DURVALU|CISPLATIN|Cisplatin|cisplat|pemetre|Doceta|docetax|DOCETAX|PEMBRO|Pembro|pembro|DOXORUBICIN|doxorubicin|Doxorubicin|IRINOTECAN|irinotecan|Irinotecan"))
+```
+
+This chunk links the wide treatment plan + patient info to drugs administered:
+```{r}
+breast_person_treatment_plan_drug<-breast_person_drug %>% 
+left_join(breast_treatment_plan, by = "PAT_MRN_ID")
+```
+
+#Amend the tables to just drugs + dates + measurements for simplicity:
+
+```{r}
+breast_person_drugs_2<-breast_person_treatment_plan_drug %>% 
+  select(person_id, drug_source_concept_name, drug_exposure_start_date, PAT_MRN_ID,gender_source_value, year_of_birth, month_of_birth, race_concept_name) %>% 
+       #filter(str_detect(drug_source_concept_name,"carboplatin|Carboplatin|CARBOPLATIN|paclit|Paclit|PACLIT|EPIRUB|Epirub|epirub|CYCLOpho|Cyclophos|cylopho")) %>% 
+  arrange(PAT_MRN_ID, drug_exposure_start_date) %>% 
+  rename(date=drug_exposure_start_date)
+  
+breast_measurements_2<-omop_join_name_all(breast_measurement)%>%
+  select(person_id, measurement_date, measurement_date,measurement_concept_name, value_as_number) %>% 
+  arrange(person_id, measurement_date) %>% 
+  rename(date=measurement_date)
+
+breast_person_drugs_2<-breast_person_drug %>% 
+  filter(str_detect(drug_source_concept_name,"atezo|Atezo|ATEZO|fluoro|Fluoro|FLUORO|Gemcitabine|gemcitabine|GEMCITABINE|NIVOLUMAB|Nivolumab|nivolumab|oxaliplatin|Oxaliplatin|OXALIPLATIN|CYCLOPH|Cyclophos|cylopho|topotecan|TOPOTECAN|Topotecan|Docetaxel|docetaxel|DOCETAXEL|paclitaxel|PACLITAXEL|Paclitaxel|Carboplatin|carboplatin|CARBOPLATIN|DPYD|dihydropyrimidine|Dihydropyrmidi|Omeprazole|omeprazole|OMEPRAZOLE|gcsf|GCSF|Gcsf|filgrastim|FILGRASTIM|Filgras|Granulocyte|granulocyte|GRANULOCYTE|Durvalum|durvalu|DURVALU|CISPLATIN|Cisplatin|cisplat|pemetre|Doceta|docetax|DOCETAX|PEMBRO|Pembro|pembro|DOXORUBICIN|doxorubicin|Doxorubicin|IRINOTECAN|irinotecan|Irinotecan"))
+
+breast_person_drugs_2 %>% arrange(person_id)
+```
+
+Filter measurements table:
+```{r}
+breast_measurements_2 %>% 
+  count(measurement_concept_name)
+
+breast_measurements_2<-breast_measurements_2 %>% 
+   filter(str_detect(measurement_concept_name,"BILI|bili|Bili|ALT|ALANINE|Alanine|alanine|CREATININE|Creatinine|creatinine|Hemoglo|hemoglob|HEMOGLOB|HAEMOGLO|haemoglobin|Haemoglobin|Hb|hb|HB|ANC|Neutroph|neutroph|Neutroph|Absolute neutro|absolute neutro|Platelet|platelet|PLATELET|ABSOLUTE NEUTRO|DPYD gene targeted mutation analysis in Blood or Tissue by Molecular genetics method|Hepatitis B|hepatitis b|HEPATIT|Body weight|Body height measure|DPYD gene targeted|Hemoglobin A/Hemoglobin|Hemoglobin A1c/Hemoglobin.total|Glucose"))
+```
+Create GCSF table:
+```{r}
+breast_person_drugs_GCSF<-breast_person_drugs_2 %>% 
+  filter(str_detect(drug_source_concept_name,"gcsf|GCSF|Gcsf|filgrastim|FILGRASTIM|Filgras|Granulocyte|granulocyte|GRANULOCYTE"))
+```
+
+Create Omeprazole table
+```{r}
+breast_person_drugs_omeprazole<-breast_person_drugs_2 %>% 
+  filter(str_detect(drug_source_concept_name,"Omeprazole|omeprazole"))
+```
+Mutate BSA based on height and weight:
+```{r}
+breast_measurements_2<-breast_measurements_2 %>% 
+  group_by(person_id) %>% 
+  mutate(height=ifelse(str_detect(measurement_concept_name,"Body height measure"),value_as_number,NA)) %>%
+  fill(height, .direction="updown") %>% 
+  mutate(weight=ifelse(str_detect(measurement_concept_name,"Body weight"),(value_as_number/1000),NA)) %>% #divide weight by 1000 as this is converted into grams from pounds (epic is american)
+  fill(weight, .direction="updown") %>% 
+  mutate(BSA=sqrt(((height*weight)/3600)))
+```
+
+
+Create flag for hepatitis B positivity:
+```{r}
+breast_measurements_2<-breast_measurements_2 %>% 
+  group_by(person_id) %>% 
+  mutate(hep_b_immune=ifelse(measurement_concept_name=="Hepatitis B virus surface Ab [Units/volume] in Serum or Plasma by Immunoassay"&value_as_number>=10,1,NA)) %>% 
+  fill(hep_b_immune,.direction="updown") %>% 
+  filter(measurement_concept_name!="Hepatitis B virus surface Ab [Units/volume] in Serum or Plasma by Immunoassay")
+```
+
+
+Change measurements to wide:
+```{r}
+breast_measurements_2 %>% 
+  ungroup() %>% 
+  filter(!is.na(value_as_number)) %>% 
+  count(measurement_concept_name)
+
+breast_measurementswide<-breast_measurements_2 %>%
+  filter(str_detect(measurement_concept_name,"BILI|bili|Bili|ALT|ALANINE|Alanine|alanine|CREAT|Creat|creat|Hemoglo|hemoglob|HEMOGLOB|HAEMOGLO|haemoglobin|Haemoglobin|Hb|hb|HB|ANC|Neutroph|neutroph|Neutroph|Absolute neutro|absolute neutro|ABSOLUTE NEUTRO|dehydrogenase|DPYD gene targeted|Body weight|Body height measure|Platelet|platelet|PLATELET|BSA|Hemoglobin A/Hemoglobin|Hemoglobin A1c/Hemoglobin.total|Glucose")) %>%  
+  group_by(person_id) %>%
+  mutate(row = row_number()) %>%
+  filter(!is.na(value_as_number)) %>% 
+  pivot_wider(names_from = "measurement_concept_name", values_from = "value_as_number") %>%
+  group_by(person_id, date) %>% 
+  fill("Bilirubin.total [Moles/volume] in Serum or Plasma",.direction="updown") %>%
+  fill("Alanine aminotransferase [Enzymatic activity/volume] in Serum or Plasma by With P-5'-P",.direction="updown") %>% 
+  fill("Neutrophils [#/volume] in Blood by Automated count",.direction="updown") %>% 
+  fill("Hemoglobin [Mass/volume] in Blood",.direction="updown") %>% 
+  fill("Creatinine [Moles/volume] in Serum or Plasma",.direction="updown") %>% 
+  fill("Creatinine [Moles/volume] in Urine",.direction="updown") %>% 
+    fill("Body height measure",.direction="updown") %>% 
+  fill("Body weight",.direction="updown") %>% 
+    fill("BSA",.direction="updown") %>% 
+  #fill("DPYD gene targeted mutation analysis in Blood or Tissue by Molecular genetics method",.direction="updown") %>% 
+
+  fill("Bilirubin.direct [Moles/volume] in Serum or Plasma",.direction="updown") %>% 
+    fill("Hemoglobin A1c/Hemoglobin.total in Blood by HPLC",.direction="updown") %>% 
+  fill("Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol",.direction="updown") %>% 
+  fill("Glucose [Mass/volume] in Blood",.direction="updown") %>% 
+  fill("Platelets [#/volume] in Blood by Automated count",.direction="updown") %>% 
+
+  select("Bilirubin.total [Moles/volume] in Serum or Plasma","Alanine aminotransferase [Enzymatic activity/volume] in Serum or Plasma by With P-5'-P","Neutrophils [#/volume] in Blood by Automated count","Hemoglobin [Mass/volume] in Blood","Creatinine [Moles/volume] in Serum or Plasma","Creatinine [Moles/volume] in Body fluid","Creatinine [Moles/volume] in Urine", "Body height measure","Body weight","BSA","Hemoglobin A1c/Hemoglobin.total in Blood by HPLC","Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol","Glucose [Mass/volume] in Blood","Platelets [#/volume] in Blood by Automated count") %>% 
+  arrange(person_id, date)
+
+breast_measurementswide<-breast_measurementswide %>% 
+  distinct(person_id, date,.keep_all=T)
+```
+Now need to decide on strategy to merge tables. Try to merge based dates being within 3 days of each other:
+```{r}
+  breast_person_drugs_2 %>% arrange(person_id, drug_exposure_start_date)
+  breast_person_drugs_2_distinct<-breast_person_drugs_2 %>% 
+  rename(date=drug_exposure_start_date) %>% 
+  distinct(person_id,date,.keep_all=T) %>% 
+    group_by(person_id) %>% 
+  arrange(person_id, date) %>%
+    mutate(daysbetweenchemo=difftime(date, lag(date), units = "days")) %>% 
+    filter(daysbetweenchemo>7|is.na(daysbetweenchemo)) %>% #to reduce numbering of cycles that are incorrect
+   filter(daysbetweenchemo<50|is.na(daysbetweenchemo)) %>%#limit to stop two different regimens being put into one
+   filter(str_detect(drug_source_concept_name,"atezo|Atezo|ATEZO|fluoro|Fluoro|FLUORO|Gemcitabine|gemcitabine|GEMCITABINE|NIVOLUMAB|Nivolumab|nivolumab|oxaliplatin|Oxaliplatin|OXALIPLATIN|CYCLOPH|Cyclophos|cylopho|topotecan|TOPOTECAN|Topotecan|Docetaxel|docetaxel|DOCETAXEL|paclitaxel|PACLITAXEL|Paclitaxel|Carboplatin|carboplatin|CARBOPLATIN|DPYD|dihydropyrimidine|Dihydropyrmidi|Durvalum|durvalu|DURVALU|CISPLATIN|Cisplatin|cisplat|pemetre|Doceta|docetax|DOCETAX|PEMBRO|Pembro|pembro|DOXORUBICIN|doxorubicin|Doxorubicin|IRINOTECAN|irinotecan|Irinotecan"))
+```
+
+Join tables and select rows where measurements are within a week of chemo:
+```{r}
+breast_person_drugs_2_distinct_2<-breast_person_drugs_2_distinct %>% 
+  left_join(breast_measurementswide,by= "person_id") %>% 
+  #arrange(date.x, date.y) %>% 
+  mutate(diff=difftime(date.x, date.y, units = "days")) %>% 
+  mutate(diff=as.numeric(diff))
+
+breast_merged_table<-breast_person_drugs_2_distinct_2 %>% 
+  ungroup() %>% 
+ filter(diff>-1&diff<8) %>% 
+  arrange(person_id,date.x) %>% 
+  distinct(person_id, date.x, .keep_all=T)
+
+
+
+```
+
+Link GCSF table and use difference in days to filter:
+```{r}
+breast_person_drugs_GCSF<-breast_person_drugs_GCSF %>% 
+  rename(date=drug_exposure_start_date) %>% 
+  mutate(GCSF="GCSF") %>% 
+  mutate(row = row_number()) %>%
+  pivot_wider(names_from=GCSF, values_from=date)
+
+breast_merged_table<-breast_merged_table %>% 
+  left_join(breast_person_drugs_GCSF, by = "person_id") %>% 
+  mutate(GCSF_drug_difference=difftime(date.x, GCSF, units = "days")) %>% 
+  mutate(GCSF_flag=ifelse(GCSF_drug_difference<8&GCSF_drug_difference>=0,1,0)) %>% 
+  distinct(person_id, date.x,.keep_all=T)
+    
+
+breast_merged_table %>% 
+  rename(drug_admin_date=date.x) %>% 
+  distinct(person_id, drug_admin_date,.keep_all=T)
+
+```
+Link omeprazole and filter by date difference:
+```{r}
+breast_person_drugs_omeprazole<-breast_person_drugs_omeprazole %>% 
+  rename(date=drug_exposure_start_date) %>% 
+  mutate(omeprazole="omeprazole") %>% 
+  mutate(row = row_number()) %>%
+  pivot_wider(names_from=omeprazole, values_from="date")
+
+breast_merged_table<-breast_merged_table %>% 
+ left_join(breast_person_drugs_omeprazole, by = "person_id") %>% 
+  mutate(omeprazole_drug_difference=difftime(date.x, omeprazole, units = "days")) %>% 
+  mutate(omeprazole_flag=ifelse(omeprazole_drug_difference<31&omeprazole_drug_difference>=0,1,0)) %>% 
+  distinct(person_id, date.x,.keep_all=T)
+    
+
+breast_merged_table<-breast_merged_table %>% 
+  rename(drug_admin_date=date.x) %>% 
+  #select(-person_MRN.x) %>% 
+  filter(str_detect(drug_source_concept_name.x,"atezo|Atezo|ATEZO|fluoro|Fluoro|FLUORO|Gemcitabine|gemcitabine|GEMCITABINE|NIVOLUMAB|Nivolumab|nivolumab|oxaliplatin|Oxaliplatin|OXALIPLATIN|CYCLOPH|Cyclophos|cylopho|topotecan|TOPOTECAN|Topotecan|Docetaxel|docetaxel|DOCETAXEL|paclitaxel|PACLITAXEL|Paclitaxel|Carboplatin|carboplatin|CARBOPLATIN|DPYD|dihydropyrimidine|Dihydropyrmidi|Durvalum|durvalu|DURVALU|CISPLATIN|Cisplatin|cisplat|pemetre|Doceta|docetax|DOCETAX|PEMBRO|Pembro|pembro|DOXORUBICIN|doxorubicin|Doxorubicin|IRINOTECAN|irinotecan|Irinotecan")) 
+```
+
+Link treatment plans:
+```{r}
+#Merge treatment plans
+breast_merged_table<-breast_treatment_plan %>% 
+  #select(PAT_MRN_ID, TREATMENT_PLAN_NAME) %>% 
+  right_join(breast_merged_table, by="PAT_MRN_ID")
+#Remove mrn 
+
+breast_merged_table<-breast_condition2 %>% 
+select(person_id, Diabetes:"Autoimmune UC",MH) %>% 
+right_join(breast_merged_table, by = "person_id")
+
+breast_merged_table<-breast_merged_table %>% 
+  arrange(person_id, drug_admin_date) %>% 
+  select(-PAT_MRN_ID, person_id, 1:17, drug_source_concept_name.x:race_concept_name.x,`Bilirubin.total [Moles/volume] in Serum or Plasma`:diff, date.y,`Body height measure`, `Body weight`, BSA, Diabetes:'Autoimmune UC',Epilepsy,MH) %>%
+  rename(fitest=date.y)
+```
+
+
+
+Amend column titles for clarity:
+```{r}
+breast_merged_table2<-breast_merged_table %>% 
+  select( -drug_source_concept_name.y,-gender_source_value,fitest, GCSF_flag, GCSF_drug_difference, -drug_source_concept_name, -year_of_birth, -month_of_birth,-race_concept_name,-gender_source_value.y,-year_of_birth.y,-month_of_birth.y,-race_concept_name.y,-row.x,-row.y, `Body height measure`, `Body weight`, BSA, Diabetes, Cardiovascular,  Thyroid, 'Chronic UC',  Resp,Arthritis, "Autoimmune UC",Epilepsy,MH) %>% 
+  rename(gender=gender_source_value.x) %>% 
+    rename(drug_source_concept_name=drug_source_concept_name.x) %>% 
+
+  rename(year_of_birth=year_of_birth.x) %>% 
+    rename(month_of_birth=month_of_birth.x) %>% 
+      rename(race_concept_name=race_concept_name.x) %>% 
+  rename(differencebetweenchemoandbloods=diff) 
+```
+
+Fill measurements by date to replace NA values:
+```{r}
+breast_merged_table3<-breast_merged_table2 %>% 
+  group_by(person_id, drug_admin_date) %>% 
+  fill("Bilirubin.total [Moles/volume] in Serum or Plasma",.direction="updown") %>%
+  fill("Alanine aminotransferase [Enzymatic activity/volume] in Serum or Plasma by With P-5'-P",.direction="updown") %>% 
+  fill("Neutrophils [#/volume] in Blood by Automated count",.direction="updown") %>% 
+  fill("Hemoglobin [Mass/volume] in Blood",.direction="updown") %>% 
+  fill("Creatinine [Moles/volume] in Serum or Plasma",.direction="updown") %>% 
+  fill("Creatinine [Moles/volume] in Urine",.direction="updown") %>% 
+    fill("Body height measure",.direction="updown") %>% 
+  fill("Body weight",.direction="updown") %>% 
+    fill("BSA",.direction="updown") %>% 
+      fill("Hemoglobin A1c/Hemoglobin.total in Blood by HPLC",.direction="updown") %>% 
+    fill("Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol",.direction="updown") %>% 
+    fill("Glucose [Mass/volume] in Blood",.direction="updown") %>% 
+    fill("Platelets [#/volume] in Blood by Automated count",.direction="updown")
+
+```
+
+Filter for chemotherapy drugs only:
+```{r}
+breast_merged_table3<-breast_merged_table3 %>% 
+  filter(str_detect(drug_source_concept_name,"atezo|Atezo|ATEZO|fluoro|Fluoro|FLUORO|Gemcitabine|gemcitabine|GEMCITABINE|NIVOLUMAB|Nivolumab|nivolumab|oxaliplatin|Oxaliplatin|OXALIPLATIN|CYCLOPH|Cyclophos|cylopho|topotecan|TOPOTECAN|Topotecan|Docetaxel|docetaxel|DOCETAXEL|paclitaxel|PACLITAXEL|Paclitaxel|Carboplatin|carboplatin|CARBOPLATIN|DPYD|dihydropyrimidine|Dihydropyrmidi|Omeprazole|omeprazole|OMEPRAZOLE|gcsf|GCSF|Gcsf|filgrastim|FILGRASTIM|Filgras|Granulocyte|granulocyte|GRANULOCYTE|Durvalum|durvalu|DURVALU|CISPLATIN|Cisplatin|cisplat|pemetre|Doceta|docetax|DOCETAX|PEMBRO|Pembro|pembro|DOXORUBICIN|doxorubicin|Doxorubicin|IRINOTECAN|irinotecan|Irinotecan")) 
+
+```
+
+
+Select one line for each date
+```{r}
+breast_merged_table4<-breast_merged_table3 %>% 
+  distinct(person_id,drug_admin_date,.keep_all=T)
+```
+
+
+Assign cycle numbers based on row and difference in days
+```{r}
+breast_merged_table5<-breast_merged_table4 %>% 
+  arrange(person_id, drug_admin_date) %>% 
+  group_by(person_id) %>% 
+  mutate(cycle=row_number()) %>% 
+  mutate(daysbetween=drug_admin_date-lag(drug_admin_date))
+```
+
+#Merge conditions to the table:
+#```{r}
+#merged_table_2<-breast_condition2 %>% 
+#  select(person_id, Diabetes:`Autoimmune UC`) %>% 
+#  merge(breast_merged_table5, by = "person_id")
+#```
+
+
+Final data cleaning:
+```{r}
+merged_table_2_breast<-breast_merged_table5 %>% 
+ # select(person_id, TREATMENT_PLAN_NAME:daysbetween) %>% 
+  mutate(GCSF_flag=ifelse(is.na(GCSF_flag),0,GCSF_flag)) %>% 
+  mutate(omeprazole_flag=ifelse(is.na(omeprazole_flag),0,omeprazole_flag)) %>% 
+  arrange(person_id, drug_admin_date)
+
+merged_table_2_breast<-merged_table_2_breast %>% 
+  arrange(person_id, drug_admin_date)
+breast_treatment_plan %>% filter(PAT_MRN_ID==00011652)
+```
+
+
+
+Rename blood columns:
+```{r}
+merged_table_3_breast<-merged_table_2_breast %>% 
+  rename(ethnicity=race_concept_name) %>% 
+  rename(SEX=gender) %>% 
+ #rename(regimen1="1") %>% 
+ #rename(regimen2="2") %>% 
+ #rename(regimen3="3") %>% 
+ #rename(regimen4="4") %>% 
+  rename(gcsf=GCSF_flag) %>% 
+  rename(ANC="Neutrophils [#/volume] in Blood by Automated count") %>% 
+  rename(PLTs="Platelets [#/volume] in Blood by Automated count") %>% 
+  rename(HB="Hemoglobin [Mass/volume] in Blood") %>% 
+  rename(creat="Creatinine [Moles/volume] in Urine") %>% 
+  rename(ALT="Alanine aminotransferase [Enzymatic activity/volume] in Serum or Plasma by With P-5'-P") %>% 
+  rename(Bil="Bilirubin.total [Moles/volume] in Serum or Plasma")
+
+merged_table_3_breast %>% arrange(person_id, drug_admin_date)
+```
+
+
+Pivot bloods and dates to wide format as per .csv used in previous validation:
+```{r}
+pivot_test_breast<-merged_table_3_breast %>% 
+  arrange(person_id, drug_admin_date) %>% 
+  group_by(person_id) %>% 
+  mutate(cycle=row_number()) %>%
+  mutate(cycle2=row_number()) %>%
+  mutate(cycle3=row_number()) %>%
+    mutate(cyclemarker2=row_number()) %>%
+
+  filter(cycle<7) %>% 
+    select(person_id, ethnicity, SEX, regimen1:regimen4, drug_admin_date, cycle, gcsf, "ANC", "PLTs", "HB", "creat","ALT","Bil", cycle, cycle2, cycle3,cyclemarker2,fitest,`Body height measure`, `Body weight`, BSA, Diabetes:"Autoimmune UC",Epilepsy,MH) %>% 
+  pivot_wider(names_from = "cycle",
+              values_from = c("ANC":"Bil"),
+              names_prefix="cycle"
+              )
+#Pivot administration dates wider
+pivot_test2_breast <- pivot_test_breast %>% 
+
+  pivot_wider(names_from = "cycle2",
+              values_from = c("drug_admin_date"), 
+              )
+
+#Rename columns
+pivot_test3_breast<-pivot_test2_breast %>% 
+  rename(cycle_1="1") %>% 
+  rename(cycle_2="2") %>% 
+  rename(cycle_3="3") %>% 
+rename(cycle_4="4") %>% 
+  rename(cycle_5="5") %>% 
+  rename(cycle_6="6")
+
+pivot_test3_breast<-pivot_test3_breast %>% 
+  pivot_wider(names_from = "cycle3",
+              values_from = "fitest", 
+              ) %>% 
+    rename(fitest1="1") %>% 
+  rename(fitest2="2") %>% 
+  rename(fitest3="3") %>% 
+rename(fitest4="4") %>% 
+  rename(fitest5="5") %>% 
+  rename(fitest6="6")
+
+pivot_test4_breast<-pivot_test3_breast %>% 
+  pivot_wider(names_from = "cyclemarker2",
+              values_from = "gcsf", 
+              ) %>% 
+    rename(gcsf1="1") %>% 
+  rename(gcsf2="2") %>% 
+  rename(gcsf3="3") %>% 
+rename(gcsf4="4") %>% 
+  rename(gcsf5="5") %>% 
+  rename(gcsf6="6")
+```
+Fill columns before changing to one line per patient:
+```{r}
+pivot_test5_breast<-pivot_test4_breast %>% 
+group_by(person_id) %>% 
+fill(ANC_cycle1, .direction="updown") %>%
+fill(ANC_cycle2, .direction="updown") %>% 
+fill(ANC_cycle3, .direction="updown") %>% 
+fill(ANC_cycle4, .direction="updown") %>% 
+fill(ANC_cycle5, .direction="updown") %>% 
+fill(ANC_cycle6, .direction="updown") %>% 
+fill(PLTs_cycle1, .direction="updown") %>% 
+fill(PLTs_cycle2, .direction="updown") %>% 
+fill(PLTs_cycle3, .direction="updown") %>% 
+fill(PLTs_cycle4, .direction="updown") %>% 
+fill(PLTs_cycle5, .direction="updown") %>% 
+fill(PLTs_cycle6, .direction="updown") %>% 
+fill(HB_cycle1, .direction="updown") %>% 
+fill(HB_cycle2, .direction="updown") %>% 
+fill(HB_cycle3, .direction="updown") %>% 
+  fill(HB_cycle4, .direction="updown") %>% 
+  fill(HB_cycle5, .direction="updown") %>% 
+  fill(HB_cycle6, .direction="updown") %>% 
+    fill(creat_cycle1, .direction="updown") %>% 
+    fill(creat_cycle2, .direction="updown") %>% 
+    fill(creat_cycle3, .direction="updown") %>% 
+    fill(creat_cycle4, .direction="updown") %>% 
+    fill(creat_cycle5, .direction="updown") %>% 
+    fill(creat_cycle6, .direction="updown") %>% 
+  fill(ALT_cycle1, .direction="updown") %>% 
+    fill(ALT_cycle2, .direction="updown") %>% 
+    fill(ALT_cycle3, .direction="updown") %>% 
+    fill(ALT_cycle4, .direction="updown") %>% 
+    fill(ALT_cycle5, .direction="updown") %>% 
+    fill(ALT_cycle6, .direction="updown") %>% 
+   fill(Bil_cycle1, .direction="updown") %>% 
+    fill(Bil_cycle2, .direction="updown") %>% 
+    fill(Bil_cycle3, .direction="updown") %>% 
+    fill(Bil_cycle4, .direction="updown") %>% 
+    fill(Bil_cycle5, .direction="updown") %>% 
+    fill(Bil_cycle6, .direction="updown") %>% 
+   fill(cycle_1, .direction="updown") %>% 
+    fill(cycle_2, .direction="updown") %>% 
+    fill(cycle_3, .direction="updown") %>% 
+    fill(cycle_4, .direction="updown") %>% 
+    fill(cycle_5, .direction="updown") %>% 
+    fill(cycle_6, .direction="updown") %>% 
+     fill(fitest1, .direction="updown") %>% 
+    fill(fitest2, .direction="updown") %>% 
+    fill(fitest3, .direction="updown") %>% 
+    fill(fitest4, .direction="updown") %>% 
+    fill(fitest5, .direction="updown") %>% 
+    fill(fitest6, .direction="updown") %>% 
+  fill(gcsf1, .direction="updown") %>% 
+    fill(gcsf2, .direction="updown") %>% 
+    fill(gcsf3, .direction="updown") %>% 
+    fill(gcsf4, .direction="updown") %>% 
+    fill(gcsf5, .direction="updown") %>% 
+    fill(gcsf6, .direction="updown")
+
+
+pivot_test5_breast %>% 
+  arrange(person_id)
+```
+
+
+Select columns in order:
+```{r}
+breast_final_table<-pivot_test5_breast %>% 
+  select(person_id, ethnicity, SEX, regimen1:regimen4, cycle_1, gcsf1, ANC_cycle1, PLTs_cycle1, HB_cycle1, creat_cycle1, ALT_cycle1, Bil_cycle1, cycle_2,fitest2, gcsf2, ANC_cycle2, PLTs_cycle2, HB_cycle2, creat_cycle2, ALT_cycle2, Bil_cycle2,cycle_3,fitest3, gcsf3, ANC_cycle3, PLTs_cycle3, HB_cycle3, creat_cycle3, ALT_cycle3, Bil_cycle3, cycle_4,fitest4, gcsf4, ANC_cycle4, PLTs_cycle4, HB_cycle4, creat_cycle4, ALT_cycle4, Bil_cycle4,cycle_5,fitest5, gcsf5, ANC_cycle5, PLTs_cycle5, HB_cycle5, creat_cycle5, ALT_cycle5, Bil_cycle5,cycle_6,fitest6, gcsf6, ANC_cycle6, PLTs_cycle6, HB_cycle6, creat_cycle6, ALT_cycle6, Bil_cycle6,`Body height measure`, `Body weight`, BSA, Diabetes, Cardiovascular, MH, Thyroid, 'Chronic UC', Resp,Arthritis, "Autoimmune UC", Epilepsy) %>% 
+  distinct(person_id, .keep_all=T) %>% 
+  mutate(cycle2_days=difftime(cycle_2,cycle_1, units="days")) %>% 
+  arrange(person_id)
+```
+
+
+
+Checks of final data compared to source:
+```{r}
+breast_final_table %>% 
+  filter(person_id==1)
+
+breast_drug %>% 
+  filter(person_id==1) %>% 
+omop_join_name_all() %>% 
+  select(drug_source_concept_name,drug_exposure_start_datetime) %>% 
+  arrange(drug_exposure_start_datetime)
+
+breast_final_table %>%filter(!is.na(cycle_6)) %>%  count(person_id) #279 patients had 6 cycles
+breast_final_table %>%filter(!is.na(cycle_5)) %>%  count(person_id) #313 patients had 6 cycles
+breast_final_table %>%filter(!is.na(cycle_4)) %>%  count(person_id) #402 patients had 4 cycles of 427
+```
+
+Diagnostics against original data
+```{r}
+breast_final_table %>% 
+filter(person_id==1) #4 cycles recorded
+#Check against drug record - 4 individual chemo dates recorded so this matches up
+breast_drug %>% 
+filter(person_id==1) %>% 
+arrange(drug_exposure_start_datetime) %>% 
+  omop_join_name_all() %>% 
+   filter(str_detect(drug_source_concept_name,"atezo|Atezo|ATEZO|fluoro|Fluoro|FLUORO|Gemcitabine|gemcitabine|GEMCITABINE|NIVOLUMAB|Nivolumab|nivolumab|OLAPARIB|Olaparib|olaparib|oxaliplatin|Oxaliplatin|OXALIPLATIN|CYCLOPH|Cyclophos|cylopho|topotecan|TOPOTECAN|Topotecan|etoposide|ETOPOSIDE|Etoposide|Docetaxel|docetaxel|DOCETAXEL|paclitaxel|PACLITAXEL|Paclitaxel|Gemcitabine|gemcitabine|GEMCITABINE|Pemetr|pemetr|PEMETRE|VINORELBINE|Vinorel|vinorelbine|Carboplatin|carboplatin|CARBOPLATIN|DPYD|dihydropyrimidine|Dihydropyrmidi|Omeprazole|omeprazole|OMEPRAZOLE|gcsf|GCSF|Gcsf|filgrastim|FILGRASTIM|Filgras|Granulocyte|granulocyte|GRANULOCYTE|carboplatin|Carboplatin|CARBOPLATIN|etoposide|Etoposide|ETOPOSIDE|atezoli|ATEZOLI|Atezol|Durvalum|durvalu|DURVALU|CISPLATIN|Cisplatin|cisplat|pemetre|PEMETRE|Pemetre|Doceta|docetax|DOCETAX|VINORELBIN|Vinorel|vinorelbin|PEMBRO|Pembro|pembro")) %>% 
+  select(drug_exposure_start_date, drug_source_concept_name)
+
+breast_measurement %>% 
+filter(person_id==1) %>% 
+arrange(measurement_date) %>% 
+  omop_join_name_all() %>% 
+    filter(str_detect(measurement_concept_name,"BILI|bili|Bili|ALT|ALANINE|Alanine|alanine|CREATININE|Creatinine|creatinine|Hemoglo|hemoglob|HEMOGLOB|HAEMOGLO|haemoglobin|Haemoglobin|Hb|hb|HB|ANC|Neutroph|neutroph|Neutroph|Absolute neutro|absolute neutro|Platelet|platelet|PLATELET|ABSOLUTE NEUTRO|DPYD gene targeted mutation analysis in Blood or Tissue by Molecular genetics method|Hepatitis B|hepatitis b|HEPATIT|Body weight|Body height measure|DPYD gene targeted|Hemoglobin A/Hemoglobin|Hemoglobin A1c/Hemoglobin.total|Glucose")) %>% 
+  select(measurement_date, measurement_concept_name) %>% 
+  arrange(measurement_date)
+
+breast_person %>% 
+  count(person_id)
+breast_person_drugs_2_distinct%>% 
+  count(person_id)
+
+```
+Finally, rejoin the treatment plan data as this did not link properly
+```{r}
+breast_final_table<-breast_person %>% 
+  select(person_id, PrimaryMrn) %>% 
+  rename(PAT_MRN_ID=PrimaryMrn) %>% 
+merge(breast_treatment_plan, by = "PAT_MRN_ID") %>% 
+ merge(breast_final_table, by = "person_id") %>% 
+  select(-PAT_MRN_ID) %>% 
+  arrange(person_id)
+```
+
+```{r}
+merged_table_3_breast %>%ungroup() %>%  count(drug_source_concept_name)
+```
+
+
+
+
+
+Write final table .csv
+```{r}
+breast_final_table<-breast_final_table %>% 
+  select(-"regimen5",-"regimen6",-"regimen7",-"regimen8",-"regimen9",-"regimen10",-"regimen11",-"regimen12",-"regimen13",-"regimen14",-"regimen15",-"regimen16", -regimen1.y,-regimen2.y,-regimen3.y,-regimen4.y, -`Body height measure`, -`Body weight`) %>% 
+  filter(!is.na(cycle2_days)) %>% 
+  rename(regimen1=regimen1.x) %>% 
+   rename(regimen2=regimen2.x) %>% 
+   rename(regimen3=regimen3.x) %>% 
+   rename(regimen4=regimen4.x)
+
+breast_final_table %>% 
+  filter(cycle2_days<100) %>% 
+  write_csv("breast_final_table.csv")
+```
+
+```{r}
+breast_drug %>% filter(person_id==1) %>% arrange(drug_exposure_start_date) %>% omop_join_name_all() %>% filter(str_detect(drug_source_concept_name,"atezo|Atezo|ATEZO|fluoro|Fluoro|FLUORO|Gemcitabine|gemcitabine|GEMCITABINE|NIVOLUMAB|Nivolumab|nivolumab|oxaliplatin|Oxaliplatin|OXALIPLATIN|CYCLOPH|Cyclophos|cylopho|topotecan|TOPOTECAN|Topotecan|Docetaxel|docetaxel|DOCETAXEL|paclitaxel|PACLITAXEL|Paclitaxel|Carboplatin|carboplatin|CARBOPLATIN|DPYD|dihydropyrimidine|Dihydropyrmidi|Omeprazole|omeprazole|OMEPRAZOLE|gcsf|GCSF|Gcsf|filgrastim|FILGRASTIM|Filgras|Granulocyte|granulocyte|GRANULOCYTE|Durvalum|durvalu|DURVALU|CISPLATIN|Cisplatin|cisplat|pemetre|Doceta|docetax|DOCETAX|PEMBRO|Pembro|pembro|DOXORUBICIN|doxorubicin|Doxorubicin|IRINOTECAN|irinotecan|Irinotecan")) %>% select(drug_exposure_start_date, drug_source_concept_name)
+
+breast_final_table %>% 
+  select(cycle_1, cycle_2, cycle_3, cycle_4, cycle_5, cycle_6)
+```
+
+
